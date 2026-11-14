@@ -5,7 +5,7 @@
 ; ============================================================
 
 #define MyAppName "Makdi"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.1.0"
 #define MyAppPublisher "Vikas Disale"
 #define MyAppURL "https://vikasdisale.com/makdi"
 #define MyAppExeName "Makdi.exe"

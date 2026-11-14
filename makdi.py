@@ -27,9 +27,10 @@ from urllib.parse import urljoin, urlparse, urldefrag
 import requests
 from bs4 import BeautifulSoup
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 TOOL_NAME = "Makdi"
 TOOL_URL = "https://vikasdisale.com/makdi"
+REPO_URL = "https://github.com/disalevikas/makdi"
 PORT = 8090
 TIMEOUT = 15
 WORKERS = 10
@@ -145,9 +146,19 @@ def fetch(url, depth):
                 "hops": len(resp.history),
                 "first_status": resp.history[0].status_code})
 
+    lastmod = ""
+    lm = resp.headers.get("Last-Modified")
+    if lm:
+        try:
+            from email.utils import parsedate_to_datetime
+            lastmod = parsedate_to_datetime(lm).date().isoformat()
+        except Exception:
+            lastmod = ""
+
     data = {"url": url, "final_url": normalize_url(resp.url),
             "status": resp.status_code, "depth": depth, "error": "",
             "ms": elapsed_ms, "kb": round(len(resp.content) / 1024, 1),
+            "lastmod": lastmod,
             "links": [], "resources": []}
 
     ctype = resp.headers.get("Content-Type", "")
@@ -340,13 +351,25 @@ def fetch_sitemap_urls(sitemap_url):
     return urls
 
 
-def crawl_worker(start_url, max_pages, workers, mode="spider"):
+def crawl_worker(start_url, max_pages, workers, mode="spider",
+                 url_list=None, include=None, exclude=None):
     root_netloc = urlparse(start_url).netloc
     scheme = urlparse(start_url).scheme or "https"
     rp, robots_found = load_robots(scheme, root_netloc)
     with STATE.lock:
         STATE.mode = mode
         STATE.robots_found = robots_found
+
+    include = [p.strip() for p in (include or []) if p.strip()]
+    exclude = [p.strip() for p in (exclude or []) if p.strip()]
+
+    def pattern_ok(u):
+        """Exclude wins; include (spider only) limits which links are followed."""
+        if any(p in u for p in exclude):
+            return False
+        if mode == "spider" and include and not any(p in u for p in include):
+            return False
+        return True
 
     def robots_allowed(u):
         if rp is None:
@@ -356,11 +379,31 @@ def crawl_worker(start_url, max_pages, workers, mode="spider"):
         except Exception:
             return True
 
-    if mode == "sitemap":
+    if mode == "list":
+        seen = set()
+        frontier = []
+        for u in (url_list or []):
+            u = normalize_url(u)
+            if u.startswith("http") and u not in seen \
+                    and (u == start_url or not any(p in u for p in exclude)):
+                seen.add(u)
+                frontier.append((u, 0))
+            if len(frontier) >= max_pages:
+                break
+        queued = set(u for u, _ in frontier)
+        follow_links = False
+        if not frontier:
+            with STATE.lock:
+                STATE.running = False
+                STATE.phase = "done"
+                STATE.error_note = "No valid URLs in the pasted list."
+            return
+    elif mode == "sitemap":
         sitemap_url = start_url
         if not sitemap_url.lower().endswith(".xml"):
             sitemap_url = f"{scheme}://{root_netloc}/sitemap.xml"
-        sm_urls = fetch_sitemap_urls(sitemap_url)[:max_pages]
+        sm_urls = [u for u in fetch_sitemap_urls(sitemap_url)
+                   if not any(p in u for p in exclude)][:max_pages]
         frontier = [(u, 0) for u in sm_urls]
         queued = set(sm_urls)
         follow_links = False
@@ -439,6 +482,7 @@ def crawl_worker(start_url, max_pages, workers, mode="spider"):
                                             "anchor": anchor,
                                             "internal": internal})
                     if follow_links and internal and is_crawlable(link) \
+                            and pattern_ok(link) \
                             and link not in queued and len(queued) < max_pages * 3:
                         queued.add(link)
                         frontier.append((link, depth + 1))
@@ -906,8 +950,9 @@ def build_snapshot():
             "inlinks": link_source_counts.get(u, 0),
             "indexable": indexable, "index_reason": index_reason,
             "issues": [{"cat": c, "msg": m} for c, m in issues],
-            "sources": link_sources.get(u, [])[:5]
-                if (status == "ERROR" or (isinstance(status, int) and status >= 400)) else [],
+            "lastmod": d.get("lastmod", ""),
+            "sources": link_sources.get(u, [])[
+                :5 if (status == "ERROR" or (isinstance(status, int) and status >= 400)) else 3],
         })
 
     # resources / images rows
@@ -985,11 +1030,13 @@ def build_snapshot():
         "links_broken": sum(1 for l in link_rows if is_bad(l["status"])),
     }
     dashboard = build_dashboard(rows, counts, redirects, res_rows, img_rows, link_rows)
+    sm_stats = {"included": sum(1 for r in rows if r["indexable"]),
+                "excluded": sum(1 for r in rows if not r["indexable"])}
     return {"running": running, "phase": phase, "queued": queued,
             "mode": mode, "robots_found": robots_found,
             "assets_total": assets_total, "assets_done": assets_done,
             "start_url": start_url, "error_note": error_note,
-            "changes": changes, "dashboard": dashboard,
+            "changes": changes, "dashboard": dashboard, "sitemap": sm_stats,
             "rows": rows, "redirects": redirects,
             "resources": res_rows, "images": img_rows,
             "links": link_rows, "counts": counts}
@@ -1094,6 +1141,47 @@ def link_suggestions():
             "pages_analyzed": len(cand_urls)}
 
 
+def build_sitemap(snap=None):
+    """XML sitemap of indexable pages only, plus a breakdown of what was left out."""
+    from xml.sax.saxutils import escape
+    snap = snap or build_snapshot()
+    rows = snap["rows"]
+    spider = snap.get("mode") == "spider"
+
+    stats = {"included": 0, "noindex": 0, "canonicalised": 0, "redirect": 0,
+             "error": 0, "blocked": 0, "other": 0}
+    lines = ['<?xml version="1.0" encoding="UTF-8"?>',
+             '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">']
+    for r in rows:
+        if not r["indexable"]:
+            reason = r["index_reason"]
+            if "Noindex" in reason:
+                stats["noindex"] += 1
+            elif "Canonicalised" in reason:
+                stats["canonicalised"] += 1
+            elif reason.startswith("Redirect"):
+                stats["redirect"] += 1
+            elif "robots" in reason.lower():
+                stats["blocked"] += 1
+            elif "HTTP" in reason or "error" in reason.lower():
+                stats["error"] += 1
+            else:
+                stats["other"] += 1
+            continue
+        stats["included"] += 1
+        lines.append("  <url>")
+        lines.append(f"    <loc>{escape(r['url'])}</loc>")
+        if r.get("lastmod"):
+            lines.append(f"    <lastmod>{r['lastmod']}</lastmod>")
+        if spider:
+            depth = r.get("depth", 0)
+            pri = "1.0" if depth == 0 else "0.8" if depth == 1 else "0.6" if depth == 2 else "0.5"
+            lines.append(f"    <priority>{pri}</priority>")
+        lines.append("  </url>")
+    lines.append("</urlset>")
+    return "\n".join(lines), stats
+
+
 def custom_search(q, mode):
     """Search stored page HTML. mode: contains | not"""
     q_low = q.lower()
@@ -1186,8 +1274,40 @@ HTML = r"""<!DOCTYPE html>
   * { margin:0; padding:0; box-sizing:border-box; }
   body { font-family:'Segoe UI',system-ui,sans-serif; background:#f0f4f8; color:#1a2b3c; padding:20px; }
   .wrap { max-width:1340px; margin:0 auto; }
-  h1 { font-size:1.45rem; color:#1F4E79; margin-bottom:14px; }
+  h1 { font-size:1.45rem; color:#1F4E79; margin:0; display:flex; align-items:center; gap:10px; }
+  h1 svg { width:30px; height:30px; }
+  h1 .ver { font-size:.8rem; color:#8a99a8; font-weight:400; letter-spacing:0; }
+  .topbar { display:flex; align-items:center; gap:16px; flex-wrap:wrap; margin-bottom:14px;
+    padding-bottom:12px; border-bottom:2px solid #e2e9f0; }
+  .menu { margin-left:auto; display:flex; gap:4px; flex-wrap:wrap; }
+  .menu a { color:#3a4b5c; text-decoration:none; font-size:.82rem; font-weight:600;
+    padding:6px 12px; border-radius:7px; }
+  .menu a:hover { background:#eef4fb; color:#1F4E79; }
+  .menumsg { display:none; margin:-4px 0 14px; padding:10px 14px; border-radius:8px;
+    font-size:.86rem; background:#eef4fb; color:#1F4E79; border:1px solid #c3d6ea; }
+  .menumsg.warn { background:#fff8e1; color:#8a6400; border-color:#ecd9a0; }
+  .menumsg a { color:inherit; font-weight:700; }
+  .modal { display:none; position:fixed; inset:0; background:rgba(15,35,60,.45); z-index:60;
+    align-items:center; justify-content:center; padding:20px; }
+  .modal.on { display:flex; }
+  .modalbox { background:#fff; border-radius:14px; padding:26px 28px; max-width:470px; width:100%;
+    box-shadow:0 20px 60px rgba(15,35,60,.3); }
+  .modalbox h2 { font-size:1.15rem; color:#1F4E79; margin-bottom:4px; display:flex; align-items:center; gap:10px; }
+  .modalbox h2 svg { width:30px; height:30px; }
+  .modalbox p { font-size:.88rem; color:#5a6b7c; margin:10px 0; line-height:1.6; }
+  .modalbox a { color:#1F4E79; font-weight:600; }
+  .modalbox .close { margin-top:16px; width:100%; }
+  @media print { .topbar .menu, .menumsg, .modal { display:none !important; } }
   .inputbar { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:16px; }
+  #urllist { width:100%; padding:11px; border:2px solid #cdd9e5; border-radius:8px; font-size:.84rem;
+    font-family:Consolas,monospace; margin:-6px 0 16px; resize:vertical; }
+  #urllist:focus { outline:none; border-color:#1F4E79; }
+  .filtersbtn { background:#eef4fb; color:#1F4E79; border:2px solid #cdd9e5; }
+  .filtersbtn:hover { background:#dceaf8; }
+  .filtersbtn.on { background:#1F4E79; color:#fff; border-color:#1F4E79; }
+  .filtersrow { display:flex; gap:10px; flex-wrap:wrap; margin:-6px 0 16px; }
+  .filtersrow input { flex:1; min-width:260px; padding:10px; border:2px solid #cdd9e5; border-radius:8px; font-size:.84rem; }
+  .filtersrow input:focus { outline:none; border-color:#1F4E79; }
   select, input[type=text], input[type=number] { padding:11px; border:2px solid #cdd9e5; border-radius:8px; font-size:.9rem; }
   select { font-weight:600; color:#1F4E79; }
   input[type=text] { flex:1; min-width:280px; }
@@ -1304,26 +1424,45 @@ HTML = r"""<!DOCTYPE html>
 </head>
 <body>
 <div class="wrap">
-  <h1 style="display:flex;align-items:center;gap:10px">
-    <svg viewBox="0 0 48 48" style="width:30px;height:30px" aria-hidden="true">
-      <g stroke="#E8A33D" stroke-width="2.6" stroke-linecap="round" fill="none">
-        <path d="M14 12 L20 19 M34 12 L28 19 M8 24 L18 24 M40 24 L30 24 M14 38 L20 30 M34 38 L28 30"/>
-      </g>
-      <circle cx="24" cy="21" r="4.5" fill="#E8A33D"/>
-      <ellipse cx="24" cy="30" rx="6" ry="7" fill="#E8A33D"/>
-      <circle cx="22" cy="20" r="1" fill="#1F4E79"/><circle cx="26" cy="20" r="1" fill="#1F4E79"/>
-    </svg>
-    MAKDI <span style="font-size:.8rem;color:#8a99a8;font-weight:400;letter-spacing:0">v""" + VERSION + r""" — the free unlimited SEO crawler</span></h1>
+  <div class="topbar">
+    <h1>
+      <svg viewBox="0 0 48 48" aria-hidden="true">
+        <g stroke="#E8A33D" stroke-width="2.6" stroke-linecap="round" fill="none">
+          <path d="M14 12 L20 19 M34 12 L28 19 M8 24 L18 24 M40 24 L30 24 M14 38 L20 30 M34 38 L28 30"/>
+        </g>
+        <circle cx="24" cy="21" r="4.5" fill="#E8A33D"/>
+        <ellipse cx="24" cy="30" rx="6" ry="7" fill="#E8A33D"/>
+        <circle cx="22" cy="20" r="1" fill="#1F4E79"/><circle cx="26" cy="20" r="1" fill="#1F4E79"/>
+      </svg>
+      MAKDI <span class="ver">v""" + VERSION + r""" — the free unlimited SEO crawler</span></h1>
+    <nav class="menu">
+      <a href="#" onclick="openHelp();return false" title="How to use Makdi">❓ Help</a>
+      <a href="#" onclick="openDataFolder();return false" title="Crawl history, logs and saved reports">📁 Data folder</a>
+      <a href="#" onclick="checkUpdate();return false" title="Check for a newer version">↻ Updates</a>
+      <a href="#" onclick="showAbout();return false">ℹ About</a>
+    </nav>
+  </div>
+  <div id="menumsg" class="menumsg"></div>
 
   <div class="inputbar">
-    <select id="mode">
+    <select id="mode" onchange="modeChanged()">
       <option value="spider">🕷 Crawl domain</option>
       <option value="sitemap">🗺 Crawl sitemap URLs</option>
+      <option value="list">📋 Paste URL list</option>
     </select>
     <input type="text" id="domain" placeholder="Enter domain (e.g. example.com) or sitemap URL (.xml)" onkeydown="if(event.key==='Enter')startCrawl()">
     <input type="number" id="maxpages" value="500" min="10" max="10000" title="Max pages">
+    <button class="filtersbtn" id="filtersBtn" onclick="toggleFilters()" title="Include / exclude URL patterns">⚙ Filters</button>
     <button id="startBtn" onclick="startCrawl()">Start Crawl</button>
     <button id="stopBtn" class="stop" onclick="stopCrawl()" style="display:none">Stop</button>
+  </div>
+
+  <textarea id="urllist" style="display:none" rows="7"
+    placeholder="Paste URLs to check — one per line (status, redirects, titles, full on-page checks for exactly these URLs)&#10;https://example.com/page-1&#10;https://example.com/old-post&#10;https://example.com/landing"></textarea>
+
+  <div class="filtersrow" id="filtersRow" style="display:none">
+    <input type="text" id="includePat" placeholder="Only crawl URLs containing… (comma-separated, spider mode) e.g. /blog/, /courses/">
+    <input type="text" id="excludePat" placeholder="Skip URLs containing… (comma-separated) e.g. /tag/, /page/, ?replytocom">
   </div>
 
   <div class="progress" id="progress">
@@ -1357,10 +1496,35 @@ HTML = r"""<!DOCTYPE html>
   <div id="tablebox"></div>
 </div>
 
+<div class="modal" id="aboutModal" onclick="if(event.target===this)closeAbout()">
+  <div class="modalbox">
+    <h2>
+      <svg viewBox="0 0 48 48" aria-hidden="true">
+        <g stroke="#E8A33D" stroke-width="2.6" stroke-linecap="round" fill="none">
+          <path d="M14 12 L20 19 M34 12 L28 19 M8 24 L18 24 M40 24 L30 24 M14 38 L20 30 M34 38 L28 30"/>
+        </g>
+        <circle cx="24" cy="21" r="4.5" fill="#E8A33D"/>
+        <ellipse cx="24" cy="30" rx="6" ry="7" fill="#E8A33D"/>
+      </svg>
+      Makdi <span style="font-weight:400;color:#8a99a8;font-size:.9rem">v<span id="abVer"></span></span>
+    </h2>
+    <p>The free unlimited SEO crawler — a free, open-source alternative to Screaming Frog with no URL limit.</p>
+    <p>Everything runs on your computer. No data is sent anywhere; crawl history, logs and reports stay in your Data folder.</p>
+    <p>
+      🌐 <a href="#" onclick="openHelp();return false">vikasdisale.com/makdi</a><br>
+      💻 <a href="#" onclick="openRepo();return false">Source code on GitHub</a><br>
+      📄 MIT licence · built by Vikas Disale
+    </p>
+    <button class="close" onclick="closeAbout()">Close</button>
+  </div>
+</div>
 <div class="overlay" id="overlay" onclick="closeDetails()"></div>
 <div class="detail" id="detail"></div>
 
 <script>
+const TOOL_URL = '""" + TOOL_URL + r"""';
+const REPO_URL = '""" + REPO_URL + r"""';
+const APP_VERSION = '""" + VERSION + r"""';
 let snapshot = null, filter = 'dashboard', pollTimer = null;
 let tabSub = {};
 let searchResults = null, searchQ = '', searchMode = 'contains';
@@ -1528,20 +1692,75 @@ function subBar(tab, extraCounts) {
   }).join('') + `</div>`;
 }
 
+/* ---------------- menu ---------------- */
+function menuMsg(html, warn) {
+  const el = document.getElementById('menumsg');
+  el.innerHTML = html;
+  el.className = 'menumsg' + (warn ? ' warn' : '');
+  el.style.display = 'block';
+  clearTimeout(window._menuT);
+  window._menuT = setTimeout(() => { el.style.display = 'none'; }, 9000);
+}
+function openHelp() { window.open(TOOL_URL, '_blank'); }
+function openRepo() { window.open(REPO_URL, '_blank'); }
+async function openDataFolder() {
+  try {
+    const d = await (await fetch('/openfolder')).json();
+    menuMsg(d.ok ? `📁 Opened your data folder — <b>${esc(d.path)}</b> (crawl history, makdi.log)`
+                 : `Could not open the folder. It is at <b>${esc(d.path)}</b>`, !d.ok);
+  } catch (e) { menuMsg('Could not open the data folder.', true); }
+}
+async function checkUpdate() {
+  menuMsg('↻ Checking for updates…');
+  try {
+    const d = await (await fetch('/checkupdate')).json();
+    if (d.status === 'update')
+      menuMsg(`🎉 Makdi <b>v${esc(d.latest)}</b> is available (you have v${APP_VERSION}) — <a href="#" onclick="openHelp();return false">download it here</a>`);
+    else if (d.status === 'current')
+      menuMsg(`✓ You are on the latest version (v${APP_VERSION}).`);
+    else
+      menuMsg(`Could not check for updates right now. Latest releases: <a href="#" onclick="openRepo();return false">GitHub</a>`, true);
+  } catch (e) { menuMsg('Could not check for updates right now.', true); }
+}
+function showAbout() {
+  document.getElementById('abVer').textContent = APP_VERSION;
+  document.getElementById('aboutModal').classList.add('on');
+}
+function closeAbout() { document.getElementById('aboutModal').classList.remove('on'); }
+
 /* ---------------- crawl control ---------------- */
+function modeChanged() {
+  const list = document.getElementById('mode').value === 'list';
+  document.getElementById('urllist').style.display = list ? 'block' : 'none';
+  document.getElementById('domain').style.display = list ? 'none' : 'block';
+}
+function toggleFilters() {
+  const row = document.getElementById('filtersRow');
+  const open = row.style.display !== 'none';
+  row.style.display = open ? 'none' : 'flex';
+  document.getElementById('filtersBtn').classList.toggle('on', !open);
+}
+
 async function startCrawl() {
   const domain = document.getElementById('domain').value.trim();
-  if (!domain) return;
-  const maxPages = parseInt(document.getElementById('maxpages').value) || 500;
   let mode = document.getElementById('mode').value;
-  if (domain.toLowerCase().endsWith('.xml')) {
+  const urlList = document.getElementById('urllist').value.trim();
+  if (mode === 'list') {
+    if (!urlList) return;
+  } else if (!domain) return;
+  const maxPages = parseInt(document.getElementById('maxpages').value) || 500;
+  if (mode !== 'list' && domain.toLowerCase().endsWith('.xml')) {
     mode = 'sitemap';
     document.getElementById('mode').value = 'sitemap';
   }
   document.getElementById('startBtn').disabled = true;
   searchResults = null;
+  linkSugg = null;
   await fetch('/crawl', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({url: domain, max_pages: maxPages, mode: mode})});
+    body: JSON.stringify({url: domain, max_pages: maxPages, mode: mode,
+      url_list: urlList,
+      include: document.getElementById('includePat').value,
+      exclude: document.getElementById('excludePat').value})});
   document.getElementById('stopBtn').style.display = 'inline-block';
   document.getElementById('progress').style.display = 'flex';
   document.getElementById('tabs').style.display = 'flex';
@@ -1833,7 +2052,9 @@ function renderDashboard(box) {
         <div class="dash-btns">
           <button onclick="location.href='/export/dashboard.xlsx'">⬇ Export Excel Report</button>
           <button class="pdfbtn" onclick="window.print()">🖨 Export PDF (Print)</button>
+          <button onclick="location.href='/export/sitemap.xml'" title="XML sitemap of indexable pages only">🗺 Build sitemap.xml</button>
         </div>
+        <div class="meta" style="margin-top:8px">🗺 Sitemap will include <b>${snapshot.sitemap ? snapshot.sitemap.included : 0}</b> indexable URLs${snapshot.sitemap && snapshot.sitemap.excluded ? ` · <b>${snapshot.sitemap.excluded}</b> left out (noindex, canonicalised, redirects, errors, blocked)` : ''}</div>
       </div>
     </div>
 
@@ -2035,7 +2256,7 @@ document.addEventListener('click', e => {
     showDetails(tr.dataset.url);
   }
 });
-document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDetails(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') { closeDetails(); closeAbout(); } });
 
 function closeDetails() {
   document.getElementById('overlay').style.display = 'none';
@@ -2191,6 +2412,24 @@ async function genLinkSugg() {
   linkSuggLoading = false; render();
 }
 
+/* ---------------- restore an existing crawl on load/reload ---------------- */
+(async function restoreSession() {
+  try {
+    const s = await (await fetch('/status')).json();
+    if (!s || !s.counts || !s.counts.total) return;
+    snapshot = s;
+    if (s.start_url) document.getElementById('domain').value = s.start_url;
+    document.getElementById('tabs').style.display = 'flex';
+    render();
+    if (s.running) {
+      document.getElementById('startBtn').disabled = true;
+      document.getElementById('stopBtn').style.display = 'inline-block';
+      document.getElementById('progress').style.display = 'flex';
+      if (!pollTimer) pollTimer = setInterval(poll, 900);
+    }
+  } catch (e) { /* no crawl yet — normal first run */ }
+})();
+
 /* ---------------- copy & export ---------------- */
 function currentUrls() {
   if (filter === 'external') return filteredData('external').map(l => l.target);
@@ -2261,12 +2500,14 @@ function exportCsv() {
     return;
   }
   if (filter === 'internal') {
-    downloadCsv(['URL','Kind','Type','Status','Indexability','Inlinks','Issues'],
+    downloadCsv(['URL','Kind','Type','Status','Indexability','Inlinks','Found On (linked from)','Issues'],
       filteredData('internal').map(x => x._kind === 'page' ?
         [x.url, 'page', x.is_html ? 'html' : 'other', x.status,
          x.indexable ? 'Indexable' : x.index_reason, x.inlinks,
+         (x.sources || []).join(' | '),
          x.issues.map(i => i.msg).join(' | ')] :
-        [x.url, 'resource', x.type, x.status, '', x.inlinks, '']), name);
+        [x.url, 'resource', x.type, x.status, '', x.inlinks,
+         (x.sources || []).join(' | '), '']), name);
     return;
   }
   if (filter === 'external') {
@@ -2311,16 +2552,17 @@ function exportCsv() {
   }
   // generic page export
   downloadCsv(
-    ['URL','Status','Indexability','Depth','Inlinks','Words','Response ms','Size KB','Resources',
+    ['URL','Status','Indexability','Found On (linked from)','Depth','Inlinks','Words','Response ms','Size KB','Resources',
      'Protocol','Mixed Content','Missing Security Headers','URL Flags',
-     'Lang','Schema Types','Title','Title Length','Meta Description','Description Length',
+     'Lang','Last-Modified','Schema Types','Title','Title Length','Meta Description','Description Length',
      'Meta Keywords','H1 (all)','H1 Count','H2 (first 5)','H2 Count','Canonical','Canonical Count','Issues'],
     filteredData(filter).map(r => [
       r.url, r.status, r.indexable ? 'Indexable' : r.index_reason,
+      (r.sources || []).join(' | '),
       r.depth, r.inlinks, r.words, r.ms, r.kb, r.res_count,
       r.https ? 'https' : 'http', r.mixed, (r.sec_missing || []).join(' | '),
       r.url_flags.join(' | '),
-      r.lang, (r.schema || []).join(' | '),
+      r.lang, r.lastmod || '', (r.schema || []).join(' | '),
       r.title, r.title ? r.title.length : 0,
       r.description, r.description ? r.description.length : 0,
       r.keywords, r.h1_all, r.h1_count, r.h2_all, r.h2_count,
@@ -2356,6 +2598,59 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/linksuggest":
             self._json(link_suggestions())
+            return
+        if self.path == "/openfolder":
+            ok, msg = True, str(DATA_DIR)
+            try:
+                if sys.platform.startswith("win"):
+                    os.startfile(DATA_DIR)
+                elif sys.platform == "darwin":
+                    import subprocess
+                    subprocess.Popen(["open", DATA_DIR])
+                else:
+                    import subprocess
+                    subprocess.Popen(["xdg-open", DATA_DIR])
+            except Exception as e:
+                ok, msg = False, f"{DATA_DIR} ({e})"
+            self._json({"ok": ok, "path": msg})
+            return
+        if self.path == "/checkupdate":
+            try:
+                r = session.get(
+                    "https://api.github.com/repos/disalevikas/makdi/releases/latest",
+                    timeout=8, headers={"Accept": "application/vnd.github+json"})
+                if r.status_code != 200:
+                    self._json({"status": "offline"})
+                    return
+                tag = (r.json().get("tag_name") or "").lstrip("vV")
+
+                def parts(v):
+                    out = []
+                    for x in v.split("."):
+                        digits = "".join(c for c in x if c.isdigit())
+                        out.append(int(digits) if digits else 0)
+                    return tuple(out + [0, 0, 0])[:3]
+
+                if not tag:
+                    self._json({"status": "unknown"})
+                elif parts(tag) > parts(VERSION):
+                    self._json({"status": "update", "latest": tag, "url": TOOL_URL})
+                else:
+                    self._json({"status": "current", "latest": tag or VERSION})
+            except Exception:
+                self._json({"status": "offline"})
+            return
+        if self.path == "/export/sitemap.xml":
+            xml, _stats = build_sitemap()
+            data = xml.encode("utf-8")
+            domain = urlparse(STATE.start_url).netloc.replace(":", "_") or "site"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/xml; charset=utf-8")
+            self.send_header("Content-Disposition",
+                             f'attachment; filename="sitemap-{domain}.xml"')
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
             return
         if self.path == "/export/dashboard.xlsx":
             self._export_xlsx()
@@ -2499,11 +2794,23 @@ class Handler(BaseHTTPRequestHandler):
             url = payload.get("url", "").strip()
             max_pages = min(int(payload.get("max_pages", 500)), 10000)
             mode = payload.get("mode", "spider")
-            if mode not in ("spider", "sitemap"):
+            if mode not in ("spider", "sitemap", "list"):
                 mode = "spider"
+            url_list = [u.strip() for u in
+                        str(payload.get("url_list", "")).replace(",", "\n").splitlines()
+                        if u.strip()][:10000]
+            include = str(payload.get("include", "")).split(",")
+            exclude = str(payload.get("exclude", "")).split(",")
         except Exception:
             self._json({"error": "bad request"}, 400)
             return
+        if mode == "list":
+            url_list = [("https://" + u) if not u.startswith("http") else u
+                        for u in url_list]
+            if not url_list:
+                self._json({"error": "no urls in list"}, 400)
+                return
+            url = url_list[0]
         if not url:
             self._json({"error": "no url"}, 400)
             return
@@ -2519,7 +2826,8 @@ class Handler(BaseHTTPRequestHandler):
             STATE.running = True
             STATE.start_url = url
 
-        threading.Thread(target=crawl_worker, args=(url, max_pages, WORKERS, mode),
+        threading.Thread(target=crawl_worker,
+                         args=(url, max_pages, WORKERS, mode, url_list, include, exclude),
                          daemon=True).start()
         self._json({"ok": True})
 
